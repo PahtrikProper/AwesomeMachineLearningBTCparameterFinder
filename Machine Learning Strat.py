@@ -16,11 +16,11 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 
 # Adjustable Parameters
-SYMBOL = 'BTC/USDT'
-TIMEFRAME = '1h'
+SYMBOL = 'sol/USDT'
+TIMEFRAME = '15M'
 LIMIT = 1000
 INITIAL_BALANCE = 1000
-NUM_EPISODES = 200
+NUM_EPISODES = 1500  # Increased number of episodes for more learning
 GAMMA = 0.99
 EPSILON_START = 1.0
 EPSILON_DECAY = 0.995
@@ -29,9 +29,7 @@ BATCH_SIZE = 64
 HIDDEN_LAYER_SIZE = 64
 MIN_PROFIT_THRESHOLD = 0.004  # 0.4% profit per trade
 RETRAIN_INTERVAL = 50  # Retrain model every 50 episodes
-
-# Paths to save files
-MODEL_SAVE_PATH = "q_network.pth"
+MODEL_SAVE_PATH = "q_network_best.pth"  # Save the best model
 REPLAY_BUFFER_SAVE_PATH = "replay_buffer.pkl"
 METRICS_SAVE_PATH = "training_metrics.csv"
 
@@ -60,10 +58,15 @@ def calculate_willr(data, period):
     willr = -100 * (high - data['close']) / (high - low)
     return willr
 
+def calculate_moving_average(data, period):
+    return data['close'].rolling(window=period).mean()
+
 def prepare_data(symbol=SYMBOL, timeframe=TIMEFRAME, limit=LIMIT, rsi_period=14, willr_period=14):
     data = fetch_ohlcv(symbol, timeframe, limit)
     data['rsi'] = calculate_rsi(data, period=rsi_period)
     data['willr'] = calculate_willr(data, period=willr_period)
+    data['ma_50'] = calculate_moving_average(data, period=50)
+    data['ma_200'] = calculate_moving_average(data, period=200)
     data.dropna(inplace=True)
     return data
 
@@ -82,6 +85,7 @@ class TradingEnv(gym.Env):
         self.drawdowns = []
         self.wins = 0
         self.losses = 0
+        self.best_reward = -np.inf
         self.model = self.train_predictive_model()
 
     def train_predictive_model(self):
@@ -90,7 +94,7 @@ class TradingEnv(gym.Env):
         self.data['price_movement'] = np.where(self.data['price_diff'] > 0, 1, 0)  # 1 if price will increase, else 0
         
         # Shift features to predict the next movement
-        features = self.data[['rsi', 'willr', 'close']].shift(1)
+        features = self.data[['rsi', 'willr', 'ma_50', 'ma_200', 'close']].shift(1)
         
         # Drop rows with NaN values from both features and labels to ensure alignment
         features = features.dropna()
@@ -107,7 +111,7 @@ class TradingEnv(gym.Env):
 
     def predict_movement(self):
         # Predict the next price movement (1 = up, 0 = down)
-        current_state = self.data.iloc[self.current_step][['rsi', 'willr', 'close']].values.reshape(1, -1)
+        current_state = self.data.iloc[self.current_step][['rsi', 'willr', 'ma_50', 'ma_200', 'close']].values.reshape(1, -1)
         return self.model.predict(current_state)[0]
 
     def reset(self):
@@ -126,6 +130,8 @@ class TradingEnv(gym.Env):
         obs = [
             self.data.iloc[self.current_step]['rsi'],
             self.data.iloc[self.current_step]['willr'],
+            self.data.iloc[self.current_step]['ma_50'],
+            self.data.iloc[self.current_step]['ma_200'],
             self.data.iloc[self.current_step]['close'],
             1 if self.position else 0
         ]
@@ -140,16 +146,15 @@ class TradingEnv(gym.Env):
             self.entry_price = current_price
         elif action == 2 and self.position is not None:  # Sell
             profit = (current_price - self.entry_price) / self.entry_price
-            if profit >= self.min_profit_threshold:  # Check if the trade is profitable
+            if profit >= self.min_profit_threshold:
                 self.wins += 1
                 reward = profit * 100  # Reward is the profit percentage
             else:
                 self.losses += 1
-                reward = -1  # Penalize for losses or small gains
+                reward = profit * 50  # Less severe penalty for small losses
             self.balance += profit * self.balance
             self.position = None
 
-        # Update max balance and drawdown
         if self.balance > self.max_balance:
             self.max_balance = self.balance
         drawdown = (self.max_balance - self.balance) / self.max_balance
@@ -185,6 +190,8 @@ def train_dqn(env, num_episodes=NUM_EPISODES, gamma=GAMMA, epsilon=EPSILON_START
     optimizer = optim.Adam(q_network.parameters())
     loss_fn = nn.MSELoss()
     replay_buffer = deque(maxlen=2000)
+
+    best_reward = -np.inf
 
     for episode in range(num_episodes):
         state = env.reset()
@@ -224,6 +231,12 @@ def train_dqn(env, num_episodes=NUM_EPISODES, gamma=GAMMA, epsilon=EPSILON_START
 
         epsilon = max(epsilon_min, epsilon * epsilon_decay)
         print(f"Episode {episode + 1}: Total Reward: {total_reward}")
+
+        # Save the best performing model
+        if total_reward > best_reward:
+            best_reward = total_reward
+            torch.save(q_network.state_dict(), MODEL_SAVE_PATH)
+            print(f"New best model saved with reward: {best_reward}")
 
         # Retrain the predictive model periodically
         if (episode + 1) % retrain_interval == 0:
@@ -318,7 +331,7 @@ def objective(rsi_period, willr_period):
     return evaluation_reward  # We now minimize based on the custom reward function
 
 # Perform Bayesian Optimization
-res_gp = gp_minimize(objective, space, n_calls=10, random_state=0)
+res_gp = gp_minimize(objective, space, n_calls=30, random_state=0)
 
 # Display the optimal parameters found
 print("\nBest hyperparameters found:")
@@ -374,7 +387,7 @@ if __name__ == "__main__":
     env = TradingEnv(dataframe)
     
     # Initialize Q-network
-    q_network = QNetwork(input_dim=4, output_dim=3, hidden_layer_size=HIDDEN_LAYER_SIZE)
+    q_network = QNetwork(input_dim=6, output_dim=3, hidden_layer_size=HIDDEN_LAYER_SIZE)
     
     # Load previous state if available
     q_network, replay_buffer, metrics = load_state(q_network)
@@ -388,5 +401,3 @@ if __name__ == "__main__":
 
     # Save the current state
     save_state(q_network, replay_buffer, metrics)
-
-# pip install ccxt pandas numpy gym torch scikit-optimize scikit-learn
